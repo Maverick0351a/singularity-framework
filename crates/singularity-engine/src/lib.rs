@@ -34,6 +34,8 @@ use std::hint::black_box;
 use std::sync::Mutex;
 use substrate_override::{OverrideChunk, VirtualSubstrate};
 
+pub mod binlex_kuna_lifter;
+pub use binlex_kuna_lifter::*;
 pub mod omni_agi;
 pub use omni_agi::*;
 pub mod radiate_graph_evo;

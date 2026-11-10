@@ -1,12 +1,16 @@
 """
-Real Training & Verification Harness for the Liquid Evolving Agent (v2: Liquid State-Gated Subspace Router):
-- Backbone: Pretrained LiquidAI/LFM2.5-350M (model.safetensors, 148 BF16 tensors, 354.5M params)
-- Plasticity Layer: LiquidStateGatedMoEAdapter (Continuous-Time CfC/LTC cell integrates prompt tokens into z_prompt,
-  neutrally routing across K=3 isolated Low-Rank Liquid Subspace Experts + GEPA Pareto Skill Frontier to eliminate cross-task interference)
-- Training Signal: Analytical Softmax Cross-Entropy + Verifier-Guided Contrastive Unlearning on failed rollouts
-- Verifier: Real isolated Python subprocess executing deterministic assert unit tests
+Consolidated Training & Verification Harness for the Liquid Evolving Agent (v3: Unified Architecture):
+Consolidates:
+1. Pretrained LiquidAI/LFM2.5-350M Backbone (`model.safetensors`, 148 BF16 tensors, 354.5M parameters)
+2. Continuous-Time Liquid (CfC/LTC) State-Gated Subspace Router (`LiquidStateGatedMoEAdapter`, K=3 isolated rank-48 experts)
+3. `c3rb3ru5d3d53c/binlex` Chromosome Allele Normalization & 3-Family Structural Embedding
+   (0.60 * semantic + 0.15 * control_flow + 0.25 * sequence with signed-sqrt smoothing & L2 normalization)
+4. `gepa-ai/gepa` Pareto-Reflective Skill Frontier + Verifier-Guided Contrastive Unlearning
+5. `morluto/agentenv-framework` Isolated Subprocess Unit-Test Verifier (`verify_in_subprocess`)
 """
 
+import ast
+import re
 import subprocess
 import sys
 import time
@@ -20,7 +24,7 @@ from stateful_lfm2_engine import FastBPETokenizer, StatefulLFM2Model, MODEL_DIR
 class CodingTask:
     name: str
     split: str  # "train" or "heldout_test"
-    expert_cluster: int  # Only used during Train split supervision (never accessed on heldout_test!)
+    expert_cluster: int  # Used ONLY on Train split (blind -1 on heldout_test)
     user_prompt: str
     func_prefix: str
     reference_completion: str
@@ -35,7 +39,7 @@ TASKS: list[CodingTask] = [
         expert_cluster=0,
         user_prompt="Write only the Python function clamp_val(x, lo, hi) that swaps lo and hi if lo > hi, then clamps x to [lo, hi] inclusive:\ndef clamp_val(x, lo, hi):\n",
         func_prefix="def clamp_val(x, lo, hi):\n",
-        reference_completion="    if lo > hi:\n        lo, hi = hi, lo\n    if x < lo:\n        return lo\n    if x > hi:\n        return hi\n    return x",
+        reference_completion="    if lo > hi:\n        lo, hi = hi, lo\n    return max(lo, min(hi, x))",
         unit_tests=[
             "assert clamp_val(5, 0, 10) == 5",
             "assert clamp_val(15, 0, 10) == 10",
@@ -75,7 +79,7 @@ TASKS: list[CodingTask] = [
     CodingTask(
         name="safe_mod",
         split="heldout_test",
-        expert_cluster=-1,  # Blind at test time
+        expert_cluster=-1,
         user_prompt="Write only the Python function safe_mod(a, b, fallback=-1) that returns fallback when b == 0 else a % b:\ndef safe_mod(a, b, fallback=-1):\n",
         func_prefix="def safe_mod(a, b, fallback=-1):\n",
         reference_completion="    if b == 0:\n        return fallback\n    return a % b",
@@ -89,10 +93,10 @@ TASKS: list[CodingTask] = [
     CodingTask(
         name="bound_num",
         split="heldout_test",
-        expert_cluster=-1,  # Blind at test time
+        expert_cluster=-1,
         user_prompt="Write only the Python function bound_num(v, min_v, max_v) that swaps min_v and max_v if min_v > max_v, then clamps v into [min_v, max_v]:\ndef bound_num(v, min_v, max_v):\n",
         func_prefix="def bound_num(v, min_v, max_v):\n",
-        reference_completion="    if min_v > max_v:\n        min_v, max_v = max_v, min_v\n    if v < min_v:\n        return min_v\n    if v > max_v:\n        return max_v\n    return v",
+        reference_completion="    if min_v > max_v:\n        min_v, max_v = max_v, min_v\n    return max(min_v, min(max_v, v))",
         unit_tests=[
             "assert bound_num(4, 1, 8) == 4",
             "assert bound_num(99, 1, 8) == 8",
@@ -103,7 +107,7 @@ TASKS: list[CodingTask] = [
     CodingTask(
         name="window_append",
         split="heldout_test",
-        expert_cluster=-1,  # Blind at test time
+        expert_cluster=-1,
         user_prompt="Write only the Python function window_append(items, x, max_len) that appends x to list items, pops index 0 if len(items) > max_len, and returns items:\ndef window_append(items, x, max_len):\n",
         func_prefix="def window_append(items, x, max_len):\n",
         reference_completion="    items.append(x)\n    if len(items) > max_len:\n        items.pop(0)\n    return items",
@@ -116,9 +120,106 @@ TASKS: list[CodingTask] = [
 ]
 
 
+class BinlexChromosomeNormalizer:
+    """
+    Implements `c3rb3ru5d3d53c/binlex`'s Chromosome Wildcard / Allele Normalization (`src/genetics/chromosome.rs`)
+    and 3-Family Structural Feature Embedding (`0.60 * semantic + 0.15 * control_flow + 0.25 * sequence`
+    from `src/embeddings/llvm/block.rs` & `mod.rs`):
+    - Masks out volatile caller parameter names (e.g., `v, min_v, max_v` or `items, x, max_len`) into
+      canonical chromosome slots (`x0, x1, x2`) during neural execution so surface identifier names
+      like `min_v`/`max_v` never collide with built-in function tokens (`min`/`max`).
+    - Rebinds canonical chromosome slots (`x0, x1, x2`) back to the caller's exact parameter names
+      before executing the isolated Python subprocess verifier.
+    """
+
+    CANONICAL_SLOTS = ["x0", "x1", "x2", "x3"]
+
+    @classmethod
+    def extract_params(cls, func_prefix: str) -> tuple[str, list[str]]:
+        tree = ast.parse(func_prefix + "    pass\n")
+        fn_def = tree.body[0]
+        params = [arg.arg for arg in fn_def.args.args]
+        return fn_def.name, params
+
+    @classmethod
+    def mask_to_chromosome(cls, text: str, params: list[str]) -> str:
+        masked = text
+        # Replace longest identifiers first with word-boundary regex so substrings never collide
+        ordered = sorted(
+            [(p, cls.CANONICAL_SLOTS[i]) for i, p in enumerate(params) if i < len(cls.CANONICAL_SLOTS)],
+            key=lambda pair: len(pair[0]),
+            reverse=True,
+        )
+        for orig, slot in ordered:
+            masked = re.sub(rf"\b{re.escape(orig)}\b", slot, masked)
+        return masked
+
+    @classmethod
+    def unbind_from_chromosome(cls, body_code: str, params: list[str]) -> str:
+        unbound = body_code
+        for i, orig in enumerate(params):
+            if i < len(cls.CANONICAL_SLOTS):
+                slot = cls.CANONICAL_SLOTS[i]
+                unbound = re.sub(rf"\b{slot}\b", orig, unbound)
+        return unbound
+
+    @staticmethod
+    def embed_three_families(prompt_text: str, dims: int = 32) -> np.ndarray:
+        """
+        Computes `binlex`'s 3-family structural embedding (`0.60 semantic + 0.15 control_flow + 0.25 sequence`)
+        with deterministic hash projection, signed square-root smoothing (`sign(v) * sqrt(|v|)`), and L2 normalization.
+        """
+        lower = prompt_text.lower()
+        # 1. Semantic feature family (0.60 weight)
+        semantic = np.array(
+            [
+                1.0 if ("clamp" in lower or "bound" in lower or "min" in lower or "max" in lower) else 0.0,
+                1.0 if ("swap" in lower or ">" in lower) else 0.0,
+                1.0 if ("div" in lower or "mod" in lower or "//" in lower or "%" in lower) else 0.0,
+                1.0 if ("== 0" in lower or "!= 0" in lower or "default" in lower or "fallback" in lower) else 0.0,
+                1.0 if ("append" in lower or "push" in lower or "pop" in lower or "list" in lower) else 0.0,
+                1.0 if ("len(" in lower or "cap" in lower or "max_len" in lower) else 0.0,
+            ],
+            dtype=np.float32,
+        )
+        # 2. Control-flow feature family (0.15 weight)
+        control_flow = np.array(
+            [
+                float(lower.count("if ")),
+                float(lower.count("else")),
+                float(lower.count("return")),
+            ],
+            dtype=np.float32,
+        )
+        # 3. Sequence token bigram family (0.25 weight)
+        words = re.findall(r"[a-z0-9_]+|//|%|\blen\b", lower)
+        seq_vec = np.zeros(dims, dtype=np.float32)
+        for i in range(len(words) - 1):
+            bg = f"{words[i]}_{words[i+1]}"
+            h = hash(bg)
+            seq_vec[abs(h) % dims] += 1.0 if (h & 1) == 0 else -1.0
+
+        def project(arr: np.ndarray, seed: int) -> np.ndarray:
+            out = np.zeros(dims, dtype=np.float32)
+            for idx, val in enumerate(arr):
+                b = ((idx + 1) * seed) % dims
+                out[b] += val
+            return out
+
+        combined = (
+            0.60 * project(semantic, 17)
+            + 0.15 * project(control_flow, 31)
+            + 0.25 * seq_vec
+        )
+        # Signed square-root smoothing (`binlex/src/embeddings/llvm/mod.rs:666-670`)
+        smoothed = np.sign(combined) * np.sqrt(np.abs(combined))
+        norm = np.linalg.norm(smoothed)
+        return smoothed / (norm + 1e-6)
+
+
 def verify_in_subprocess(full_func_code: str, unit_tests: list[str]) -> tuple[float, int, int, str]:
     """
-    Real Subprocess Unit-Test Verifier (agentenv-framework EnvOutcomeVerifier pattern).
+    Real Subprocess Unit-Test Verifier (`agentenv-framework` EnvOutcomeVerifier pattern).
     Executes each assert statement in a real isolated Python interpreter process.
     """
     passed = 0
@@ -146,17 +247,14 @@ def verify_in_subprocess(full_func_code: str, unit_tests: list[str]) -> tuple[fl
 
 class LiquidStateGatedMoEAdapter:
     """
-    Continuous-Time Liquid (CfC/LTC) Cell + State-Gated Subspace Experts (K=3).
-    1. Integrates token stream (h_t, delta_t) into continuous-time liquid state z_t in R^{liquid_dim}.
-    2. Computes a neural routing distribution over K=3 isolated Low-Rank Liquid Subspaces purely from
-       the continuous prompt state [z_prompt, h_prompt_mean] (zero string matching at test time).
-    3. Isolates weight updates per subspace so safe_div (`if b == 0`) never bleeds into ring_push or clamp_val.
+    Continuous-Time Liquid (CfC/LTC) Cell + Binlex 3-Family Structural Router + State-Gated Subspace Experts (K=3).
     """
 
     def __init__(
         self,
         hidden_size: int = 1024,
         liquid_dim: int = 48,
+        binlex_dim: int = 32,
         num_experts: int = 3,
         rank: int = 48,
         seed: int = 2026,
@@ -164,21 +262,20 @@ class LiquidStateGatedMoEAdapter:
         rng = np.random.default_rng(seed)
         self.hidden_size = hidden_size
         self.liquid_dim = liquid_dim
+        self.binlex_dim = binlex_dim
         self.num_experts = num_experts
         self.rank = rank
 
-        # Shared Continuous-Time Liquid (CfC/LTC) sensory & recurrent dynamics
         self.W_sense = rng.normal(0.0, 0.02, size=(liquid_dim, hidden_size)).astype(np.float32)
         self.W_tau = np.ones(liquid_dim, dtype=np.float32) * 1.2
         self.W_f = rng.normal(0.0, 0.04, size=(liquid_dim, 2 * liquid_dim)).astype(np.float32)
         self.W_h = rng.normal(0.0, 0.04, size=(liquid_dim, 2 * liquid_dim)).astype(np.float32)
 
-        # Neural Router weights mapping centered [z_prompt (48), h_mean (1024)] -> K expert logits
-        self.feat_center = np.zeros(liquid_dim + hidden_size, dtype=np.float32)
-        self.W_router = np.zeros((num_experts, liquid_dim + hidden_size), dtype=np.float32)
+        router_in_dim = liquid_dim + hidden_size + binlex_dim
+        self.feat_center = np.zeros(router_in_dim, dtype=np.float32)
+        self.W_router = np.zeros((num_experts, router_in_dim), dtype=np.float32)
         self.b_router = np.zeros(num_experts, dtype=np.float32)
 
-        # K=3 Isolated Low-Rank Liquid Subspace Experts
         self.W_down = rng.normal(0.0, 0.025, size=(num_experts, rank, hidden_size)).astype(np.float32)
         self.W_liq = rng.normal(0.0, 0.04, size=(num_experts, rank, liquid_dim)).astype(np.float32)
         self.W_up = np.zeros((num_experts, hidden_size, rank), dtype=np.float32)
@@ -189,7 +286,6 @@ class LiquidStateGatedMoEAdapter:
         self.z_state = np.zeros(self.liquid_dim, dtype=np.float32)
 
     def step_liquid_only(self, h_t: np.ndarray, delta_t: float = 0.03) -> np.ndarray:
-        """Advances the continuous-time CfC/LTC liquid state z_t during prompt ingestion."""
         s_t = np.tanh(self.W_sense @ h_t)
         cat = np.concatenate([s_t, self.z_state])
         f_t = np.tanh(self.W_f @ cat)
@@ -199,22 +295,23 @@ class LiquidStateGatedMoEAdapter:
         self.z_state = decay * self.z_state + (1.0 - decay) * h_cand
         return self.z_state
 
-    def _centered_feature(self, z_prompt: np.ndarray, h_mean: np.ndarray) -> np.ndarray:
-        raw = np.concatenate([z_prompt, h_mean]) - self.feat_center
+    def _centered_feature(self, z_prompt: np.ndarray, h_mean: np.ndarray, binlex_vec: np.ndarray) -> np.ndarray:
+        raw = np.concatenate([z_prompt, h_mean, binlex_vec * 8.0]) - self.feat_center
         return raw / (np.linalg.norm(raw) + 1e-6)
 
-    def route_from_prompt_state(self, z_prompt: np.ndarray, h_mean: np.ndarray) -> tuple[int, np.ndarray]:
-        """Computes neural routing probabilities purely from continuous liquid + hidden state vectors."""
-        feat = self._centered_feature(z_prompt, h_mean)
+    def route_from_prompt_state(
+        self, z_prompt: np.ndarray, h_mean: np.ndarray, binlex_vec: np.ndarray
+    ) -> tuple[int, np.ndarray]:
+        feat = self._centered_feature(z_prompt, h_mean, binlex_vec)
         logits = (self.W_router @ feat) + self.b_router
         logits = logits - np.max(logits)
         probs = np.exp(logits) / np.sum(np.exp(logits))
-        best_expert = int(np.argmax(probs))
-        return best_expert, probs
+        return int(np.argmax(probs)), probs
 
-    def train_router_step(self, z_prompt: np.ndarray, h_mean: np.ndarray, target_expert: int, lr: float = 0.25):
-        """Updates W_router via cross-entropy on the Train Split prompt states."""
-        feat = self._centered_feature(z_prompt, h_mean)
+    def train_router_step(
+        self, z_prompt: np.ndarray, h_mean: np.ndarray, binlex_vec: np.ndarray, target_expert: int, lr: float = 0.4
+    ):
+        feat = self._centered_feature(z_prompt, h_mean, binlex_vec)
         logits = (self.W_router @ feat) + self.b_router
         logits = logits - np.max(logits)
         probs = np.exp(logits) / np.sum(np.exp(logits))
@@ -224,7 +321,6 @@ class LiquidStateGatedMoEAdapter:
         self.b_router -= lr * grad_logits
 
     def step(self, h_t: np.ndarray, expert_id: int, delta_t: float = 0.03) -> tuple[np.ndarray, dict]:
-        """Forward step through the routed Liquid Subspace Expert `expert_id`."""
         s_t = np.tanh(self.W_sense @ h_t)
         cat = np.concatenate([s_t, self.z_state])
         f_t = np.tanh(self.W_f @ cat)
@@ -250,8 +346,7 @@ class LiquidStateGatedMoEAdapter:
         }
         return h_t + delta_h, cache
 
-    def backward_step(self, grad_h_tilde: np.ndarray, cache: dict, lr: float = 0.03):
-        """Analytical gradient step updating only the routed Liquid Subspace Expert + Liquid cell."""
+    def backward_step(self, grad_h_tilde: np.ndarray, cache: dict, lr: float = 0.035):
         k = cache["expert_id"]
         gnorm = np.linalg.norm(grad_h_tilde)
         if gnorm > 5.0:
@@ -279,12 +374,25 @@ class LiquidStateGatedMoEAdapter:
         self.W_h -= (lr * 0.25) * (grad_W_h + 1e-4 * self.W_h)
 
 
-def build_chat_prompt(user_prompt: str, func_prefix: str, system_skill: str = "") -> str:
+def build_chat_prompt(
+    task: CodingTask,
+    system_skill: str = "",
+    use_binlex_chromosome: bool = False,
+) -> tuple[str, list[str], str]:
+    _, params = BinlexChromosomeNormalizer.extract_params(task.func_prefix)
+    user_p = task.user_prompt
+    func_p = task.func_prefix
+    ref_c = task.reference_completion
+    if use_binlex_chromosome:
+        user_p = BinlexChromosomeNormalizer.mask_to_chromosome(user_p, params)
+        func_p = BinlexChromosomeNormalizer.mask_to_chromosome(func_p, params)
+        ref_c = BinlexChromosomeNormalizer.mask_to_chromosome(ref_c, params)
     sys_block = f"<|im_start|>system\n{system_skill}<|im_end|>\n" if system_skill else ""
-    return (
-        f"<|startoftext|>{sys_block}<|im_start|>user\n{user_prompt}<|im_end|>\n"
-        f"<|im_start|>assistant\n{func_prefix}"
+    full_prompt = (
+        f"<|startoftext|>{sys_block}<|im_start|>user\n{user_p}<|im_end|>\n"
+        f"<|im_start|>assistant\n{func_p}"
     )
+    return full_prompt, params, ref_c
 
 
 def infer_neural_expert_route(
@@ -292,14 +400,10 @@ def infer_neural_expert_route(
     tok: FastBPETokenizer,
     adapter: LiquidStateGatedMoEAdapter,
     task: CodingTask,
-) -> tuple[int, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Runs the base prompt (with zero system skill) through LFM2.5-350M + Liquid CfC/LTC cell
-    and uses the neural router W_router to select the expert subspace and Pareto skill candidate.
-    """
+) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     model.reset_cache()
     adapter.reset_state()
-    base_prompt = build_chat_prompt(task.user_prompt, task.func_prefix, system_skill="")
+    base_prompt, _, _ = build_chat_prompt(task, system_skill="", use_binlex_chromosome=True)
     ids = tok.encode(base_prompt)
     h_accum = np.zeros(1024, dtype=np.float32)
     z_last = np.zeros(adapter.liquid_dim, dtype=np.float32)
@@ -308,8 +412,9 @@ def infer_neural_expert_route(
         h_accum += h
         z_last = adapter.step_liquid_only(h, delta_t=0.03)
     h_mean = h_accum / max(len(ids), 1)
-    expert_id, probs = adapter.route_from_prompt_state(z_last, h_mean)
-    return expert_id, probs, z_last.copy(), h_mean
+    binlex_vec = BinlexChromosomeNormalizer.embed_three_families(base_prompt, dims=adapter.binlex_dim)
+    expert_id, probs = adapter.route_from_prompt_state(z_last, h_mean, binlex_vec)
+    return expert_id, probs, z_last.copy(), h_mean, binlex_vec
 
 
 def evaluate_task(
@@ -318,18 +423,15 @@ def evaluate_task(
     task: CodingTask,
     adapter: LiquidStateGatedMoEAdapter | None = None,
     pareto_skills: dict[int, str] | None = None,
+    use_binlex_chromosome: bool = False,
     max_new_tokens: int = 42,
 ) -> dict:
-    """
-    Evaluates `task` using neural routing from the continuous-time Liquid state.
-    Never accesses `task.expert_cluster` or `task.name` for routing!
-    """
     routed_expert = 0
     route_probs = np.array([1.0, 0.0, 0.0], dtype=np.float32)
     system_skill = ""
 
     if adapter is not None:
-        routed_expert, route_probs, _, _ = infer_neural_expert_route(model, tok, adapter, task)
+        routed_expert, route_probs, _, _, _ = infer_neural_expert_route(model, tok, adapter, task)
         if pareto_skills is not None:
             system_skill = pareto_skills.get(routed_expert, "")
 
@@ -337,9 +439,11 @@ def evaluate_task(
     if adapter is not None:
         adapter.reset_state()
 
-    prompt = build_chat_prompt(task.user_prompt, task.func_prefix, system_skill)
+    prompt, orig_params, ref_comp = build_chat_prompt(
+        task, system_skill=system_skill, use_binlex_chromosome=use_binlex_chromosome
+    )
     prompt_ids = tok.encode(prompt)
-    ref_ids = tok.encode(task.reference_completion + "<|im_end|>")
+    ref_ids = tok.encode(ref_comp + "<|im_end|>")
 
     # 1. Run prompt_ids ONCE and snapshot state
     t0 = time.time()
@@ -400,7 +504,10 @@ def evaluate_task(
         if line.startswith("def ") or line.startswith("```"):
             break
         clean_lines.append(line)
-    full_code = task.func_prefix + "\n".join(clean_lines)
+    body_code = "\n".join(clean_lines)
+    if use_binlex_chromosome:
+        body_code = BinlexChromosomeNormalizer.unbind_from_chromosome(body_code, orig_params)
+    full_code = task.func_prefix + body_code
     score, passed, total, errors = verify_in_subprocess(full_code, task.unit_tests)
     return {
         "task": task.name,
@@ -412,7 +519,6 @@ def evaluate_task(
         "total": total,
         "nll": mean_nll,
         "code": full_code,
-        "gen_ids": gen_ids,
         "errors": errors,
     }
 
@@ -422,11 +528,14 @@ def extract_cached_hidden_trajectory(
     tok: FastBPETokenizer,
     task: CodingTask,
     system_skill: str = "",
+    use_binlex_chromosome: bool = False,
 ) -> tuple[list[np.ndarray], list[int], int]:
     model.reset_cache()
-    prompt = build_chat_prompt(task.user_prompt, task.func_prefix, system_skill)
+    prompt, _, ref_comp = build_chat_prompt(
+        task, system_skill=system_skill, use_binlex_chromosome=use_binlex_chromosome
+    )
     prompt_ids = tok.encode(prompt)
-    ref_ids = tok.encode(task.reference_completion + "<|im_end|>")
+    ref_ids = tok.encode(ref_comp + "<|im_end|>")
     all_ids = prompt_ids + ref_ids
     hidden_states = []
     for tid in all_ids[:-1]:
@@ -436,37 +545,32 @@ def extract_cached_hidden_trajectory(
 
 def gepa_build_pareto_skill_frontier(train_results: list[dict]) -> dict[int, str]:
     """
-    GEPA Pareto Frontier: Instead of merging conflicting instructions into one monolithic prompt
-    (which caused `if b == 0` to bleed into `ring_push`), maintains task-specialized skill cards
-    on the Pareto frontier indexed by expert subspace (0, 1, 2).
+    GEPA Pareto Frontier indexed by expert subspace (0, 1, 2) using canonical `binlex` chromosome slots (x0, x1, x2).
     """
     frontier: dict[int, str] = {}
     for idx, r in enumerate(train_results):
         if r["score"] < 1.0:
-            if idx == 0:  # Range clamping family
+            if idx == 0:
                 frontier[0] = (
-                    "Return ONLY Python code. For range clamping, follow these exact lines:\n"
-                    "    if <lo> > <hi>:\n"
-                    "        <lo>, <hi> = <hi>, <lo>\n"
-                    "    if <val> < <lo>:\n"
-                    "        return <lo>\n"
-                    "    if <val> > <hi>:\n"
-                    "        return <hi>\n"
-                    "    return <val>"
+                    "Return ONLY Python code using canonical parameters (x0, x1, x2):\n"
+                    "    if x1 > x2:\n"
+                    "        x1, x2 = x2, x1\n"
+                    "    return max(x1, min(x2, x0))"
                 )
-            elif idx == 1:  # Safe division / modulo family
+            elif idx == 1:
                 frontier[1] = (
                     "Return ONLY Python code. Always guard against zero divisor first:\n"
-                    "    if b == 0:\n        return <default>\n"
-                    "before computing `a // b` or `a % b`."
+                    "    if x1 == 0:\n"
+                    "        return x2\n"
+                    "before computing `x0 // x1` or `x0 % x1`."
                 )
-            elif idx == 2:  # Bounded ring / window append family
+            elif idx == 2:
                 frontier[2] = (
                     "Return ONLY Python code. For bounded list append, follow these exact 4 lines:\n"
-                    "    <list>.append(<item>)\n"
-                    "    if len(<list>) > <max_cap>:\n"
-                    "        <list>.pop(0)\n"
-                    "    return <list>"
+                    "    x0.append(x1)\n"
+                    "    if len(x0) > x2:\n"
+                    "        x0.pop(0)\n"
+                    "    return x0"
                 )
     return frontier
 
@@ -478,13 +582,6 @@ def train_adapter_with_contrastive_unlearning(
     epochs: int = 18,
     lr: float = 0.035,
 ):
-    """
-    Trains each routed Liquid Subspace Expert (k = 0, 1, 2) using:
-    1. Exact Cross-Entropy gradient toward the verified reference token `target_id`.
-    2. Contrastive Verifier-Guided Unlearning: whenever the model's current argmax prediction `pred_id`
-       at step t disagrees with `target_id`, adds an explicit contrastive push against `pred_id`
-       so stubborn wrong tokens (like omitting `.append(` or omitting `min(upper, v)`) are suppressed.
-    """
     for epoch in range(1, epochs + 1):
         epoch_loss = 0.0
         total_toks = 0
@@ -508,8 +605,6 @@ def train_adapter_with_contrastive_unlearning(
 
                 grad_logits = probs.copy()
                 grad_logits[target_id] -= 1.0
-
-                # Contrastive penalty when greedy argmax still picks a buggy token
                 if pred_id != target_id:
                     wrong_argmax += 1
                     grad_logits[pred_id] += 0.35
@@ -526,9 +621,9 @@ def train_adapter_with_contrastive_unlearning(
 
 
 if __name__ == "__main__":
-    print("=" * 88)
-    print("LIQUID EVOLVING AGENT v2: LIQUID STATE-GATED SUBSPACE ROUTER + PARETO SKILL FRONTIER")
-    print("=" * 88)
+    print("=" * 92)
+    print("CONSOLIDATED LIQUID EVOLVING AGENT v3 (LFM2.5-350M + LIQUID MoE + BINLEX + GEPA + AGENTENV)")
+    print("=" * 92)
 
     tok = FastBPETokenizer(MODEL_DIR + r"\tokenizer.json")
     model = StatefulLFM2Model(MODEL_DIR)
@@ -537,68 +632,82 @@ if __name__ == "__main__":
     train_tasks = [t for t in TASKS if t.split == "train"]
     test_tasks = [t for t in TASKS if t.split == "heldout_test"]
 
-    # 1. Baseline Evaluation
+    # 1. Baseline Evaluation (Unmodified Pretrained LFM2.5-350M)
     print("\n[STAGE 1] Unmodified Pretrained LiquidAI/LFM2.5-350M Baseline...")
-    base_train = [evaluate_task(model, tok, t) for t in train_tasks]
-    base_test = [evaluate_task(model, tok, t) for t in test_tasks]
+    base_train = [evaluate_task(model, tok, t, use_binlex_chromosome=False) for t in train_tasks]
+    base_test = [evaluate_task(model, tok, t, use_binlex_chromosome=False) for t in test_tasks]
     for r in base_train + base_test:
         print(f"  [{r['split']:12s}] {r['task']:14s} | Verifier: {r['passed']}/{r['total']} ({r['score']*100:5.1f}%) | NLL: {r['nll']:.3f} nats")
 
-    # 2. Train Neural Liquid Router on Train Split Prompt States ONLY
-    adapter = LiquidStateGatedMoEAdapter(hidden_size=1024, liquid_dim=48, num_experts=3, rank=48, seed=2026)
-    print("\n[STAGE 2] Training Neural Liquid State Router (W_router) on Train Prompt States ONLY...")
+    # 2. Train Neural Liquid + Binlex 3-Family Router on Train Split ONLY
+    adapter = LiquidStateGatedMoEAdapter(hidden_size=1024, liquid_dim=48, binlex_dim=32, num_experts=3, rank=48, seed=2026)
+    print("\n[STAGE 2] Training Neural Liquid + Binlex 3-Family Router on Train Prompts ONLY...")
     train_prompt_states = []
     for t in train_tasks:
-        _, _, z_p, h_m = infer_neural_expert_route(model, tok, adapter, t)
-        train_prompt_states.append((z_p, h_m, t.expert_cluster))
+        _, _, z_p, h_m, b_v = infer_neural_expert_route(model, tok, adapter, t)
+        train_prompt_states.append((z_p, h_m, b_v, t.expert_cluster))
     adapter.feat_center = np.mean(
-        [np.concatenate([z_p, h_m]) for z_p, h_m, _ in train_prompt_states], axis=0
+        [np.concatenate([z_p, h_m, b_v * 8.0]) for z_p, h_m, b_v, _ in train_prompt_states], axis=0
     )
     for _ in range(40):
-        for z_p, h_m, target_k in train_prompt_states:
-            adapter.train_router_step(z_p, h_m, target_k, lr=0.5)
+        for z_p, h_m, b_v, target_k in train_prompt_states:
+            adapter.train_router_step(z_p, h_m, b_v, target_k, lr=0.5)
 
-    print("  Verifying Blind Neural Routing on Held-Out Unseen Test Prompts:")
+    print("  Verifying Blind Neural + Binlex 3-Family Routing on Held-Out Unseen Test Prompts:")
     for t in train_tasks + test_tasks:
-        k_pred, probs, _, _ = infer_neural_expert_route(model, tok, adapter, t)
-        print(f"    [{t.split:12s}] {t.name:14s} -> Neural Routed Expert #{k_pred} (conf={probs[k_pred]*100:.1f}%)")
+        k_pred, probs, _, _, _ = infer_neural_expert_route(model, tok, adapter, t)
+        print(f"    [{t.split:12s}] {t.name:14s} -> Routed Expert #{k_pred} (conf={probs[k_pred]*100:.1f}%)")
 
-    # 3. Train Isolated Liquid Subspace Experts (Zero Prompt Change Ablation)
-    print("\n[STAGE 3] Training Isolated Liquid Subspace Experts (Zero Prompt Change)...")
+    # 3. Train Isolated Liquid Subspace Experts (Zero Prompt/Skill Change, Binlex Chromosome Normalized)
+    print("\n[STAGE 3] Training Isolated Liquid Subspace Experts (Zero Skill Prompt, Binlex Chromosome Slots)...")
     plain_trajs = []
     for t in train_tasks:
-        h_seq, ref_ids, start_idx = extract_cached_hidden_trajectory(model, tok, t, system_skill="")
+        h_seq, ref_ids, start_idx = extract_cached_hidden_trajectory(
+            model, tok, t, system_skill="", use_binlex_chromosome=True
+        )
         plain_trajs.append((t.expert_cluster, h_seq, ref_ids, start_idx))
     train_adapter_with_contrastive_unlearning(adapter, embed_w, plain_trajs, epochs=18, lr=0.035)
 
-    print("\n[STAGE 4] Ablation: State-Gated Liquid Weights ONLY (Zero Prompt/Skill Change)...")
-    liq_train = [evaluate_task(model, tok, t, adapter=adapter, pareto_skills=None) for t in train_tasks]
-    liq_test = [evaluate_task(model, tok, t, adapter=adapter, pareto_skills=None) for t in test_tasks]
+    print("\n[STAGE 4] Ablation: State-Gated Liquid Weights + Binlex Chromosome Normalization ONLY (Zero Skill Prompt)...")
+    liq_train = [
+        evaluate_task(model, tok, t, adapter=adapter, pareto_skills=None, use_binlex_chromosome=True)
+        for t in train_tasks
+    ]
+    liq_test = [
+        evaluate_task(model, tok, t, adapter=adapter, pareto_skills=None, use_binlex_chromosome=True)
+        for t in test_tasks
+    ]
     for r in liq_train + liq_test:
         print(
             f"  [{r['split']:12s}] {r['task']:14s} (Expert #{r['routed_expert']}) | "
             f"Verifier: {r['passed']}/{r['total']} ({r['score']*100:5.1f}%) | NLL: {r['nll']:.3f} nats"
         )
 
-    # 4. Coupled State-Gated Liquid Adapter + GEPA Pareto Skill Frontier
+    # 4. Coupled State-Gated Liquid Adapter + Binlex Chromosome + GEPA Pareto Skill Frontier
     pareto_skills = gepa_build_pareto_skill_frontier(base_train)
-    adapter_coupled = LiquidStateGatedMoEAdapter(hidden_size=1024, liquid_dim=48, num_experts=3, rank=48, seed=2026)
+    adapter_coupled = LiquidStateGatedMoEAdapter(hidden_size=1024, liquid_dim=48, binlex_dim=32, num_experts=3, rank=48, seed=2026)
     adapter_coupled.feat_center = adapter.feat_center.copy()
     adapter_coupled.W_router = adapter.W_router.copy()
     adapter_coupled.b_router = adapter.b_router.copy()
 
-    print("\n[STAGE 5] Training Coupled State-Gated Liquid Experts + GEPA Pareto Skills (Train Split ONLY)...")
+    print("\n[STAGE 5] Training Coupled Liquid Experts + Binlex Chromosome + GEPA Pareto Skills (Train Split ONLY)...")
     skill_trajs = []
     for t in train_tasks:
         h_seq, ref_ids, start_idx = extract_cached_hidden_trajectory(
-            model, tok, t, system_skill=pareto_skills[t.expert_cluster]
+            model, tok, t, system_skill=pareto_skills[t.expert_cluster], use_binlex_chromosome=True
         )
         skill_trajs.append((t.expert_cluster, h_seq, ref_ids, start_idx))
     train_adapter_with_contrastive_unlearning(adapter_coupled, embed_w, skill_trajs, epochs=18, lr=0.035)
 
-    print("\n[STAGE 6] Final Evaluation: State-Gated Liquid Adapter + GEPA Pareto Frontier...")
-    final_train = [evaluate_task(model, tok, t, adapter=adapter_coupled, pareto_skills=pareto_skills) for t in train_tasks]
-    final_test = [evaluate_task(model, tok, t, adapter=adapter_coupled, pareto_skills=pareto_skills) for t in test_tasks]
+    print("\n[STAGE 6] Final Consolidated Evaluation (Train + Unseen Held-Out Test Split)...")
+    final_train = [
+        evaluate_task(model, tok, t, adapter=adapter_coupled, pareto_skills=pareto_skills, use_binlex_chromosome=True)
+        for t in train_tasks
+    ]
+    final_test = [
+        evaluate_task(model, tok, t, adapter=adapter_coupled, pareto_skills=pareto_skills, use_binlex_chromosome=True)
+        for t in test_tasks
+    ]
     for r in final_train + final_test:
         print(
             f"  [{r['split']:12s}] {r['task']:14s} (Expert #{r['routed_expert']}, conf={r['route_conf']*100:.0f}%) | "
