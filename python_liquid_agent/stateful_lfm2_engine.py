@@ -148,10 +148,30 @@ class StatefulLFM2Model:
         self.num_layers = len(self.layer_types)
         self.hidden_size = self.cfg["hidden_size"]
         self.t = self._load_safetensors(model_dir + r"\model.safetensors")
+        self._apply_futhark_horizontal_soac_fusion()
         self.freqs = 1.0 / (
             1000000.0 ** (np.arange(0, 64, 2, dtype=np.float32) / 64.0)
         )
         self.reset_cache()
+
+    def _apply_futhark_horizontal_soac_fusion(self):
+        """
+        Applies Futhark Horizontal SOAC Fusion (`src/Futhark/Optimise/Fusion.hs`):
+        - Horizontally fuses `feed_forward.w1` [4608, 1024] and `feed_forward.w3` [4608, 1024]
+          which share the exact same consumer input `ffn_in` into `w13_fused` [9216, 1024].
+        - Horizontally fuses `q_proj` [1024, 1024], `k_proj` [512, 1024], and `v_proj` [512, 1024]
+          which share the exact same consumer input `normed` into `qkv_fused` [2048, 1024].
+        """
+        for i, ltype in enumerate(self.layer_types):
+            p = f"model.layers.{i}."
+            w1 = self.t.pop(p + "feed_forward.w1.weight")
+            w3 = self.t.pop(p + "feed_forward.w3.weight")
+            self.t[p + "feed_forward.w13_fused"] = np.ascontiguousarray(np.vstack([w1, w3]))
+            if ltype != "conv":
+                wq = self.t.pop(p + "self_attn.q_proj.weight")
+                wk = self.t.pop(p + "self_attn.k_proj.weight")
+                wv = self.t.pop(p + "self_attn.v_proj.weight")
+                self.t[p + "self_attn.qkv_fused"] = np.ascontiguousarray(np.vstack([wq, wk, wv]))
 
     @staticmethod
     def _load_safetensors(path: str) -> dict[str, np.ndarray]:
@@ -214,9 +234,10 @@ class StatefulLFM2Model:
                 ring[1] = u
                 op_out = self.t[p + "conv.out_proj.weight"] @ (C * conv_out)
             else:
-                q = (self.t[p + "self_attn.q_proj.weight"] @ normed).reshape(16, 64)
-                k = (self.t[p + "self_attn.k_proj.weight"] @ normed).reshape(8, 64)
-                v = (self.t[p + "self_attn.v_proj.weight"] @ normed).reshape(8, 64)
+                qkv = self.t[p + "self_attn.qkv_fused"] @ normed
+                q = qkv[0:1024].reshape(16, 64)
+                k = qkv[1024:1536].reshape(8, 64)
+                v = qkv[1536:2048].reshape(8, 64)
                 q = self._rms_norm_1d(q, self.t[p + "self_attn.q_layernorm.weight"])
                 k = self._rms_norm_1d(k, self.t[p + "self_attn.k_layernorm.weight"])
                 # Apply RoPE
@@ -243,8 +264,9 @@ class StatefulLFM2Model:
 
             h = h + op_out
             ffn_in = self._rms_norm_1d(h, self.t[p + "ffn_norm.weight"])
-            w1 = self.t[p + "feed_forward.w1.weight"] @ ffn_in
-            w3 = self.t[p + "feed_forward.w3.weight"] @ ffn_in
+            w13 = self.t[p + "feed_forward.w13_fused"] @ ffn_in
+            w1 = w13[0:4608]
+            w3 = w13[4608:9216]
             silu_w1 = w1 / (1.0 + np.exp(-np.clip(w1, -40.0, 40.0)))
             h = h + (self.t[p + "feed_forward.w2.weight"] @ (silu_w1 * w3))
 

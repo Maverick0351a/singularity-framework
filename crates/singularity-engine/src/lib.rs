@@ -36,6 +36,8 @@ use substrate_override::{OverrideChunk, VirtualSubstrate};
 
 pub mod binlex_kuna_lifter;
 pub use binlex_kuna_lifter::*;
+pub mod futhark_soac_fusion;
+pub use futhark_soac_fusion::*;
 pub mod omni_agi;
 pub use omni_agi::*;
 pub mod radiate_graph_evo;

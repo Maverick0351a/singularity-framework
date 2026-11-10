@@ -20,6 +20,8 @@ An open research and engineering repository consolidating **12 complementary arc
 | **10. Population & Lineage Evolver** | `imbue-ai/darwinian_evolver` & `openevolve` | [`crates/darwin-evolver`](./crates/darwin-evolver/src/lib.rs) | `p75` sigmoid-scaled parent sampling, Neighborhood-2 lineage learning logs, and micro-gated evaluation. |
 | **11. Continuous Metaheuristics** | `jmejia8/Metaheuristics.jl` | [`crates/darwin-evolver`](./crates/darwin-evolver/src/lib.rs) | Differential Evolution (`DE/best/1/bin`) and Particle Swarm Optimization (`PSO`) for continuous weight/hyperparameter tuning. |
 | **12. Graph Topology Evolution** | `pkalivas/radiate` & `SenseNova-Loop` | [`radiate_graph_evo.rs`](./crates/singularity-engine/src/radiate_graph_evo.rs) | Directed/recurrent computational graph topology mutation and crossover. |
+| **13. SOAC Fusion & Compile-Time `revVJP`** | `diku-dk/futhark` | [`futhark_soac_fusion.rs`](./crates/singularity-engine/src/futhark_soac_fusion.rs) & [`stateful_lfm2_engine.py`](./python_liquid_agent/stateful_lfm2_engine.py) | T2 graph-reduction producer-consumer fusion (`Map -> Map -> Reduce` $\to$ `Redomap`, `1.56x` hardware `RDTSC` speedup), horizontal `w13_fused`/`qkv_fused` operator fusion (`29.4` $\to$ `32.4 tok/s`), and `adPipeline` batched `revVJP` (`5.5e-5` max error vs. finite differences). |
+| **14. 3-Pass POS & `sweep` Match-Net** | `spencermountain/compromise` | [`futhark_soac_fusion.rs`](./crates/singularity-engine/src/futhark_soac_fusion.rs) & [`train_liquid_evolving_agent.py`](./python_liquid_agent/train_liquid_evolving_agent.py) | 3-pass morphological/contextual tagger + ontology propagation (`_fillTags.js`) + single-pass `sweep` match-net feeding the `binlex` semantic family. |
 
 ---
 

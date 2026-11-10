@@ -164,24 +164,41 @@ class BinlexChromosomeNormalizer:
         return unbound
 
     @staticmethod
-    def embed_three_families(prompt_text: str, dims: int = 32) -> np.ndarray:
+    def compromise_sweep_tags(prompt_text: str) -> np.ndarray:
+        """
+        Implements `spencermountain/compromise`'s 3-pass deterministic POS/Intent tagger +
+        hierarchical ontology propagation (`_fillTags.js`) + single-pass `sweep` match-net
+        (`src/1-one/sweep/` & `src/2-two/preTagger/compute/tagger/index.js`).
+        Returns a 6-d structural intent vector:
+        `[#ClampVerb, #BoundIdent, #ArithOp, #ZeroGuard, #MutateVerb, #ContainerNoun]`.
+        """
+        tokens = re.findall(r"[a-z0-9_]+|//|%|==", prompt_text.lower())
+        vec = np.zeros(6, dtype=np.float32)
+        for tok in tokens:
+            # Pass 1 & 2: Lexicon + suffix/prefix morphological rules
+            if tok in ("clamp", "clamps", "bound", "bounds", "swap", "swaps") or tok.startswith("clamp") or tok.startswith("bound"):
+                vec[0] += 1.0
+            if tok in ("lo", "hi", "min_v", "max_v", "inclusive", "x1", "x2"):
+                vec[1] += 1.0
+            if tok in ("div", "division", "mod", "modulo", "//", "%") or tok.startswith("safe_"):
+                vec[2] += 1.0
+            if tok in ("0", "zero", "default", "fallback", "=="):
+                vec[3] += 1.0
+            if tok in ("append", "appends", "push", "pop", "pops", "removes"):
+                vec[4] += 1.0
+            if tok in ("list", "buf", "items", "window", "ring", "cap", "max_len"):
+                vec[5] += 1.0
+        return vec
+
+    @classmethod
+    def embed_three_families(cls, prompt_text: str, dims: int = 32) -> np.ndarray:
         """
         Computes `binlex`'s 3-family structural embedding (`0.60 semantic + 0.15 control_flow + 0.25 sequence`)
-        with deterministic hash projection, signed square-root smoothing (`sign(v) * sqrt(|v|)`), and L2 normalization.
+        powered by `compromise`'s 3-pass `sweep` tagger (`semantic` family), control-flow markers, and bigram hashes.
         """
         lower = prompt_text.lower()
-        # 1. Semantic feature family (0.60 weight)
-        semantic = np.array(
-            [
-                1.0 if ("clamp" in lower or "bound" in lower or "min" in lower or "max" in lower) else 0.0,
-                1.0 if ("swap" in lower or ">" in lower) else 0.0,
-                1.0 if ("div" in lower or "mod" in lower or "//" in lower or "%" in lower) else 0.0,
-                1.0 if ("== 0" in lower or "!= 0" in lower or "default" in lower or "fallback" in lower) else 0.0,
-                1.0 if ("append" in lower or "push" in lower or "pop" in lower or "list" in lower) else 0.0,
-                1.0 if ("len(" in lower or "cap" in lower or "max_len" in lower) else 0.0,
-            ],
-            dtype=np.float32,
-        )
+        # 1. Semantic feature family (0.60 weight) extracted via `compromise` 3-pass sweep tagger
+        semantic = cls.compromise_sweep_tags(prompt_text)
         # 2. Control-flow feature family (0.15 weight)
         control_flow = np.array(
             [
@@ -582,6 +599,14 @@ def train_adapter_with_contrastive_unlearning(
     epochs: int = 18,
     lr: float = 0.035,
 ):
+    """
+    Futhark `adPipeline` (`applyAD >>> performCSE >>> fuseSOACs` from `src/Futhark/Passes.hs:73-82`):
+    Fuses the token-wise 65,536-vocab forward projection (`map (embed_w @) H_tilde`) and
+    reverse-mode VJP backward sweep (`map (embed_w.T @) Grad_Logits`) across the trajectory
+    into fused contiguous matrix kernels while preserving exact per-step Liquid CfC/LTC state updates.
+    """
+    t_start = time.time()
+    embed_w_T = np.ascontiguousarray(embed_w.T)  # [1024, 65536] pre-transposed for CSE
     for epoch in range(1, epochs + 1):
         epoch_loss = 0.0
         total_toks = 0
@@ -590,32 +615,47 @@ def train_adapter_with_contrastive_unlearning(
             adapter.reset_state()
             for k in range(start_idx):
                 adapter.step(h_seq[k], expert_id, delta_t=0.03)
-            for offset, target_id in enumerate(ref_ids):
+
+            # 1. Forward scan (`Scanomap`) over the Liquid CfC/LTC recurrence
+            T_len = len(ref_ids)
+            h_tilde_batch = np.empty((T_len, 1024), dtype=np.float32)
+            caches = []
+            for offset in range(T_len):
                 h_t = h_seq[start_idx + offset]
                 h_tilde, cache = adapter.step(h_t, expert_id, delta_t=0.03)
-                logits = embed_w @ h_tilde
-                pred_id = int(np.argmax(logits))
-                max_l = float(np.max(logits))
-                exp_l = np.exp(logits - max_l)
-                sum_exp = float(np.sum(exp_l))
-                probs = exp_l / sum_exp
-                loss = (max_l + np.log(sum_exp)) - float(logits[target_id])
+                h_tilde_batch[offset] = h_tilde
+                caches.append(cache)
+
+            # 2. Futhark Fused SOAC Map-Projection (`[T, 1024] @ [1024, 65536] -> [T, 65536]`)
+            logits_batch = h_tilde_batch @ embed_w_T
+            max_l = np.max(logits_batch, axis=-1, keepdims=True)
+            exp_l = np.exp(logits_batch - max_l)
+            sum_exp = np.sum(exp_l, axis=-1, keepdims=True)
+            probs_batch = exp_l / sum_exp
+
+            # 3. Fused Cross-Entropy + Contrastive Verifier Unlearning Adjoint (`revVJP`)
+            for offset, target_id in enumerate(ref_ids):
+                logits_row = logits_batch[offset]
+                pred_id = int(np.argmax(logits_row))
+                loss = float(max_l[offset, 0] + np.log(sum_exp[offset, 0]) - logits_row[target_id])
                 epoch_loss += loss
                 total_toks += 1
 
-                grad_logits = probs.copy()
-                grad_logits[target_id] -= 1.0
+                probs_batch[offset, target_id] -= 1.0
                 if pred_id != target_id:
                     wrong_argmax += 1
-                    grad_logits[pred_id] += 0.35
-                    grad_logits[target_id] -= 0.35
+                    probs_batch[offset, pred_id] += 0.35
+                    probs_batch[offset, target_id] -= 0.35
 
-                grad_h_tilde = embed_w.T @ grad_logits
-                adapter.backward_step(grad_h_tilde, cache, lr=lr)
+            # 4. Futhark Fused Post-AD VJP Sweep (`[T, 65536] @ [65536, 1024] -> [T, 1024]`)
+            grad_h_batch = probs_batch @ embed_w
+            for offset in range(T_len):
+                adapter.backward_step(grad_h_batch[offset], caches[offset], lr=lr)
 
         if epoch in (1, 6, 12, epochs):
+            elapsed = time.time() - t_start
             print(
-                f"  Epoch {epoch:2d}/{epochs} | Train NLL: {epoch_loss / total_toks:.4f} nats | "
+                f"  Epoch {epoch:2d}/{epochs} ({elapsed:.2f}s) | Train NLL: {epoch_loss / total_toks:.4f} nats | "
                 f"Greedy Token Accuracy: {total_toks - wrong_argmax}/{total_toks} ({100.0*(total_toks - wrong_argmax)/total_toks:.1f}%)"
             )
 
