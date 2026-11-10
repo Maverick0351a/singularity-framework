@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Python caches & virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Large model weights (>50MB) fetched via python_liquid_agent/download_lfm2_weights.py
+*.safetensors
+*.gguf
+real_pretrained_weights/exp3_python_blocks.npz

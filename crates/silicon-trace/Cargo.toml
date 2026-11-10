@@ -1,0 +1,10 @@
+[package]
+name = "silicon-trace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hardware branch flight-recorder ring buffer, #155 monotonic time mapper, TSX transaction queue, and follow-table callstack compressor reverse-engineered from janestreet/magic-trace"
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true

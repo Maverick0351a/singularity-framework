@@ -1,0 +1,10 @@
+[package]
+name = "liquid-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Closed-form Continuous-time (CfC), Liquid Time-Constant (LTC), 4-layer AutoNCP sparse wiring, and LFM2 double-gated ShortConv operators in pure Rust"
+
+[dependencies]
+serde.workspace = true
+rand.workspace = true

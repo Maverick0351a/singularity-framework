@@ -1,0 +1,10 @@
+[package]
+name = "substrate-override"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Zero-copy 3-layer sector/byte virtualization, in-flight CPIO prepending, and OS parameter handoff reverse-engineered from ventoy/Ventoy"
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
